@@ -23,6 +23,23 @@ const POLL_MS = 20000;
 const LIMIT = 50;
 const SEEN_KEY = "swamp-runs.failed-seen";
 
+// swamp records a workflow's steps as separate method runs, with no link to the
+// workflow run. For counts and toasts, drop a method run that started inside a
+// workflow run of the same repo (a running or suspended workflow has no end yet).
+function topLevel(runs) {
+  const wfs = runs.filter((r) => r.kind === "workflow");
+  return runs.filter((r) => {
+    if (r.kind !== "method") return true;
+    const t = Date.parse(r.startedAt);
+    return !wfs.some((w) => {
+      if (w.repo !== r.repo) return false;
+      const start = Date.parse(w.startedAt) - 2000;
+      const open = w.status === "running" || w.status === "suspended" || w.ms == null;
+      return t >= start && (open || t <= Date.parse(w.startedAt) + w.ms + 2000);
+    });
+  });
+}
+
 const expand = (p) => (p.startsWith("~/") ? home() + p.slice(1) : p);
 const short = (p) => (p.startsWith(home()) ? "~" + p.slice(home().length) : p);
 const base = (p) => p.split("/").filter(Boolean).pop() ?? p;
@@ -203,8 +220,8 @@ export default class SwampRuns extends View {
         this.announce();
         // For the status item: counts and when this was read.
         setShared("swamp-runs.summary", {
-          running: all.filter((r) => r.status === "running").length,
-          failedToday: all.filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length,
+          running: topLevel(all).filter((r) => r.status === "running").length,
+          failedToday: topLevel(all).filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length,
           at: Date.now(),
         });
       } finally {
@@ -219,7 +236,7 @@ export default class SwampRuns extends View {
   // The failures already seen are shared, so a docked copy and a window copy
   // never toast the same failure twice.
   announce() {
-    const failedNow = this.runs.filter((r) => r.status === "failed");
+    const failedNow = topLevel(this.runs).filter((r) => r.status === "failed");
     const seenList = shared(SEEN_KEY);
     if (!Array.isArray(seenList) || !this.known) {
       // First load: remember what has failed so far, toast nothing.
@@ -293,8 +310,9 @@ export default class SwampRuns extends View {
       .filter((r) => this.filter === "all" || r.kind === this.filter)
       .filter((r) => !this.failedOnly || r.status === "failed")
       .slice(0, LIMIT);
-    const running = this.runs.filter((r) => r.status === "running").length;
-    const failed24 = this.runs.filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length;
+    const top = topLevel(this.runs);
+    const running = top.filter((r) => r.status === "running").length;
+    const failed24 = top.filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length;
 
     const stop = (el) => el.on_mouse_down("left", (_e, cx) => cx.stop_propagation());
     const chip = (id, label, on, onClick) =>
