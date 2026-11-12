@@ -27,16 +27,44 @@ const SEEN_KEY = "swamp-runs.failed-seen";
 // workflow run. For counts and toasts, drop a method run that started inside a
 // workflow run of the same repo (a running or suspended workflow has no end yet).
 function topLevel(runs) {
-  const wfs = runs.filter((r) => r.kind === "workflow");
+  // Index each repo's workflow windows once. Invalid dates never matched the
+  // old comparisons, and a closed window ending before its start is empty.
+  const byRepo = new Map();
+  for (const w of runs) {
+    if (w.kind !== "workflow") continue;
+    const started = Date.parse(w.startedAt);
+    const start = started - 2000;
+    const open = w.status === "running" || w.status === "suspended" || w.ms == null;
+    const end = open ? Infinity : Number(started + w.ms + 2000);
+    if (Number.isNaN(start) || Number.isNaN(end) || end < start) continue;
+    if (!byRepo.has(w.repo)) byRepo.set(w.repo, []);
+    byRepo.get(w.repo).push([start, end]);
+  }
+  for (const [repo, windows] of byRepo) {
+    windows.sort((a, b) => a[0] - b[0]);
+    const merged = [];
+    for (const window of windows) {
+      const last = merged[merged.length - 1];
+      if (last && window[0] <= last[1]) last[1] = Math.max(last[1], window[1]);
+      else merged.push(window);
+    }
+    byRepo.set(repo, merged);
+  }
   return runs.filter((r) => {
     if (r.kind !== "method") return true;
     const t = Date.parse(r.startedAt);
-    return !wfs.some((w) => {
-      if (w.repo !== r.repo) return false;
-      const start = Date.parse(w.startedAt) - 2000;
-      const open = w.status === "running" || w.status === "suspended" || w.ms == null;
-      return t >= start && (open || t <= Date.parse(w.startedAt) + w.ms + 2000);
-    });
+    const windows = byRepo.get(r.repo);
+    if (Number.isNaN(t) || !windows) return true;
+    // Find the last window starting at or before this method. Both ends are
+    // inclusive, including the existing two-second tolerance.
+    let lo = 0;
+    let hi = windows.length;
+    while (lo < hi) {
+      const mid = Math.floor((lo + hi) / 2);
+      if (windows[mid][0] <= t) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo === 0 || t > windows[lo - 1][1];
   });
 }
 
@@ -123,6 +151,7 @@ export default class SwampRuns extends View {
   init(_props, cx) {
     this.swamp = "swamp";
     this.runs = []; // merged, newest first
+    this.top = []; // top-level runs, computed once per completed refresh
     this.repoErrors = {};
     this.loading = true;
     this.filter = "all"; // all | workflow | method
@@ -217,11 +246,12 @@ export default class SwampRuns extends View {
         }
         all.sort((a, b) => Date.parse(b.startedAt ?? 0) - Date.parse(a.startedAt ?? 0));
         this.runs = all;
+        this.top = topLevel(all);
         this.announce();
         // For the status item: counts and when this was read.
         setShared("swamp-runs.summary", {
-          running: topLevel(all).filter((r) => r.status === "running").length,
-          failedToday: topLevel(all).filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length,
+          running: this.top.filter((r) => r.status === "running").length,
+          failedToday: this.top.filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length,
           at: Date.now(),
         });
       } finally {
@@ -236,7 +266,7 @@ export default class SwampRuns extends View {
   // The failures already seen are shared, so a docked copy and a window copy
   // never toast the same failure twice.
   announce() {
-    const failedNow = topLevel(this.runs).filter((r) => r.status === "failed");
+    const failedNow = this.top.filter((r) => r.status === "failed");
     const seenList = shared(SEEN_KEY);
     if (!Array.isArray(seenList) || !this.known) {
       // First load: remember what has failed so far, toast nothing.
@@ -310,7 +340,7 @@ export default class SwampRuns extends View {
       .filter((r) => this.filter === "all" || r.kind === this.filter)
       .filter((r) => !this.failedOnly || r.status === "failed")
       .slice(0, LIMIT);
-    const top = topLevel(this.runs);
+    const top = this.top;
     const running = top.filter((r) => r.status === "running").length;
     const failed24 = top.filter((r) => r.status === "failed" && Date.now() - Date.parse(r.startedAt) < 86400000).length;
 
